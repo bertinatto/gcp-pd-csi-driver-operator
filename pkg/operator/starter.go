@@ -74,7 +74,8 @@ func RunOperator(ctx context.Context, controllerConfig *controllercmd.Controller
 
 	// Create GenericOperatorclient. This is used by the library-go controllers created down below
 	gvr := opv1.SchemeGroupVersion.WithResource("clustercsidrivers")
-	operatorClient, dynamicInformers, err := goc.NewClusterScopedOperatorClientWithConfigName(controllerConfig.KubeConfig, gvr, string(opv1.GCPPDCSIDriver))
+	gvk := opv1.SchemeGroupVersion.WithKind("ClusterCSIDriver")
+	operatorClient, dynamicInformers, err := goc.NewClusterScopedOperatorClientWithConfigName(controllerConfig.KubeConfig, gvr, gvk, string(opv1.GCPPDCSIDriver))
 	if err != nil {
 		return err
 	}

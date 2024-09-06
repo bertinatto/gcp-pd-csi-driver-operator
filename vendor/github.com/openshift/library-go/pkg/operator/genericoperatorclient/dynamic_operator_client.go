@@ -7,24 +7,26 @@ import (
 	"strings"
 	"time"
 
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/klog/v2"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	operatorv1 "github.com/openshift/api/operator/v1"
+	applyoperatorv1 "github.com/openshift/client-go/operator/applyconfigurations/operator/v1"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 )
 
 const defaultConfigName = "cluster"
 
-func newClusterScopedOperatorClient(config *rest.Config, gvr schema.GroupVersionResource) (*dynamicOperatorClient, dynamicinformer.DynamicSharedInformerFactory, error) {
+func newClusterScopedOperatorClient(config *rest.Config, gvr schema.GroupVersionResource, gvk schema.GroupVersionKind) (*dynamicOperatorClient, dynamicinformer.DynamicSharedInformerFactory, error) {
 	dynamicClient, err := dynamic.NewForConfig(config)
 	if err != nil {
 		return nil, nil, err
@@ -35,13 +37,14 @@ func newClusterScopedOperatorClient(config *rest.Config, gvr schema.GroupVersion
 	informer := informers.ForResource(gvr)
 
 	return &dynamicOperatorClient{
+		kind:     gvk,
 		informer: informer,
 		client:   client,
 	}, informers, nil
 }
 
-func NewClusterScopedOperatorClient(config *rest.Config, gvr schema.GroupVersionResource) (v1helpers.OperatorClientWithFinalizers, dynamicinformer.DynamicSharedInformerFactory, error) {
-	d, informers, err := newClusterScopedOperatorClient(config, gvr)
+func NewClusterScopedOperatorClient(config *rest.Config, gvr schema.GroupVersionResource, gvk schema.GroupVersionKind) (v1helpers.OperatorClientWithFinalizers, dynamicinformer.DynamicSharedInformerFactory, error) {
+	d, informers, err := newClusterScopedOperatorClient(config, gvr, gvk)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -50,11 +53,11 @@ func NewClusterScopedOperatorClient(config *rest.Config, gvr schema.GroupVersion
 
 }
 
-func NewClusterScopedOperatorClientWithConfigName(config *rest.Config, gvr schema.GroupVersionResource, configName string) (v1helpers.OperatorClientWithFinalizers, dynamicinformer.DynamicSharedInformerFactory, error) {
+func NewClusterScopedOperatorClientWithConfigName(config *rest.Config, gvr schema.GroupVersionResource, gvk schema.GroupVersionKind, configName string) (v1helpers.OperatorClientWithFinalizers, dynamicinformer.DynamicSharedInformerFactory, error) {
 	if len(configName) < 1 {
 		return nil, nil, fmt.Errorf("config name cannot be empty")
 	}
-	d, informers, err := newClusterScopedOperatorClient(config, gvr)
+	d, informers, err := newClusterScopedOperatorClient(config, gvr, gvk)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -64,6 +67,7 @@ func NewClusterScopedOperatorClientWithConfigName(config *rest.Config, gvr schem
 }
 
 type dynamicOperatorClient struct {
+	kind       schema.GroupVersionKind
 	configName string
 	informer   informers.GenericInformer
 	client     dynamic.ResourceInterface
@@ -168,6 +172,91 @@ func (c dynamicOperatorClient) UpdateOperatorStatus(ctx context.Context, resourc
 	}
 
 	return retStatus, nil
+}
+
+func (c dynamicOperatorClient) ApplyOperator(ctx context.Context, fieldManager string, applyConfiguration *applyoperatorv1.OperatorSpecApplyConfiguration) (err error) {
+	applyMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(applyConfiguration)
+	if err != nil {
+		return fmt.Errorf("failed to convert to unstructured: %w", err)
+	}
+	applyUnstructured := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"spec": applyMap,
+		},
+	}
+	applyUnstructured.SetGroupVersionKind(c.kind)
+	applyUnstructured.SetName(c.configName)
+
+	uncastOriginal, err := c.informer.Lister().Get(c.configName)
+	if err != nil {
+		return fmt.Errorf("unable to read existing: %w", err)
+	}
+	switch {
+	case apierrors.IsNotFound(err):
+		// do nothing and proceed with the apply
+	case err != nil:
+		return fmt.Errorf("unable to read existing: %w", err)
+	default:
+		original := uncastOriginal.(*unstructured.Unstructured)
+		if allRequiredFieldsArePresent(original, applyUnstructured) {
+			// nothing to apply, so return early
+			return nil
+		}
+	}
+
+	_, err = c.client.Apply(ctx, c.configName, applyUnstructured, metav1.ApplyOptions{
+		Force:        true,
+		FieldManager: fieldManager,
+	})
+	if err != nil {
+		return fmt.Errorf("unable to ApplyStatus for operator: %w", err)
+	}
+
+	return nil
+}
+
+func (c dynamicOperatorClient) ApplyOperatorStatus(ctx context.Context, fieldManager string, applyConfiguration *applyoperatorv1.OperatorStatusApplyConfiguration) (err error) {
+	applyMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(applyConfiguration)
+	if err != nil {
+		return fmt.Errorf("failed to convert to unstructured: %w", err)
+	}
+	applyUnstructured := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"status": applyMap,
+		},
+	}
+	applyUnstructured.SetGroupVersionKind(c.kind)
+	applyUnstructured.SetName(c.configName)
+
+	uncastOriginal, err := c.informer.Lister().Get(c.configName)
+	switch {
+	case apierrors.IsNotFound(err):
+		// do nothing and proceed with the apply
+	case err != nil:
+		return fmt.Errorf("unable to read existing: %w", err)
+	default:
+		original := uncastOriginal.(*unstructured.Unstructured)
+		if allRequiredFieldsArePresent(original, applyUnstructured) {
+			// nothing to apply, so return early
+			return nil
+		}
+	}
+
+	_, err = c.client.ApplyStatus(ctx, c.configName, applyUnstructured, metav1.ApplyOptions{
+		Force:        true,
+		FieldManager: fieldManager,
+	})
+	if err != nil {
+		return fmt.Errorf("unable to ApplyStatus for operator: %w", err)
+	}
+
+	return nil
+}
+
+// TODO eventually this must also make sure that all previously managed fields are set
+// TODO make work eventually.  We're making unnecessary calls, but for starting out with a transition this is probably acceptable since no write occurs.
+func allRequiredFieldsArePresent(original, required *unstructured.Unstructured) bool {
+	return false
 }
 
 func (c dynamicOperatorClient) EnsureFinalizer(ctx context.Context, finalizer string) error {
